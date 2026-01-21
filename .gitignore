@@ -1,0 +1,17 @@
+testdata/
+test_data/
+medium_test/
+medium_output/
+
+# test outputs / extracts
+**/test_output/
+**/test_extract/
+**/extract_test/
+
+# archive volumes created during local testing
+*.tar
+
+# built binary (local artifact)
+/ptar
+
+rlaunch.sh

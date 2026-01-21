@@ -1,0 +1,167 @@
+package scanner
+
+import (
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+
+	"github.com/karrick/godirwalk"
+)
+
+// unboundedDirQueue 是一个无界阻塞队列：
+// - Push：无容量上限，不会因“队列满”阻塞/失败（除非已 Close）
+// - Pop：队列为空时阻塞等待；Close 后且队列清空时返回 ok=false
+//
+// 用它替代有界 channel，可以避免扫描 worker 在向同一个有界队列追加子目录时“全部阻塞，导致没人消费队列”的死锁。
+type unboundedDirQueue struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	closed bool
+	items  []string
+	head   int // 避免 Pop 时 O(n) copy 造成热点；通过 head 前移实现近似无锁队列语义
+}
+
+func newUnboundedDirQueue() *unboundedDirQueue {
+	q := &unboundedDirQueue{items: make([]string, 0, 1024), head: 0}
+	q.cond = sync.NewCond(&q.mu)
+	return q
+}
+
+func (q *unboundedDirQueue) Push(dir string) bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return false
+	}
+	q.items = append(q.items, dir)
+	q.cond.Signal()
+	return true
+}
+
+func (q *unboundedDirQueue) Pop() (dir string, ok bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for q.head >= len(q.items) && !q.closed {
+		q.cond.Wait()
+	}
+	if q.head >= len(q.items) {
+		return "", false
+	}
+	dir = q.items[q.head]
+	q.head++
+
+	// 定期收缩底层 slice，避免无限增长；阈值取折中，减少 copy 次数
+	if q.head > 4096 && q.head*2 >= len(q.items) {
+		// 把剩余元素搬到新 slice（均摊成本，避免每次 Pop copy）
+		remaining := make([]string, len(q.items)-q.head)
+		copy(remaining, q.items[q.head:])
+		q.items = remaining
+		q.head = 0
+	}
+	return dir, true
+}
+
+func (q *unboundedDirQueue) Close() {
+	q.mu.Lock()
+	q.closed = true
+	q.mu.Unlock()
+	q.cond.Broadcast()
+}
+
+type Scanner struct {
+	ScanWorkers int // 并行扫描的worker数量，0表示使用默认值
+
+	// Stats (optional): these counters can be read by the caller for diagnosing bottlenecks.
+	DirsScanned   uint64
+	EntriesEmitted uint64
+}
+
+func NewScanner() *Scanner {
+	return &Scanner{
+		ScanWorkers: 0, // 0表示使用默认值
+	}
+}
+
+// ScanStats exposes scanner counters for diagnostics (best-effort).
+func (scanner *Scanner) ScanStats() (dirs uint64, entries uint64) {
+	return atomic.LoadUint64(&scanner.DirsScanned), atomic.LoadUint64(&scanner.EntriesEmitted)
+}
+
+// 并行扫描实现：使用 worker pool + 目录队列，多个 goroutine 同时扫描不同目录。
+// 重要：绝不丢目录（队列满则阻塞等待），并用 WaitGroup 精确判断扫描完成，避免忙等。
+// 函数会阻塞直到所有目录扫描完成并 entries channel 关闭。
+func (scanner *Scanner) Scan(inputpath string, entries chan string, errors chan error) {
+	// 如果ScanWorkers为0，使用默认值
+	workers := scanner.ScanWorkers
+	if workers <= 0 {
+		workers = 8 // 默认8个扫描worker，对于1亿文件可以设置更大（如16-64）
+	}
+
+	dirQueue := newUnboundedDirQueue()
+	var workersWg sync.WaitGroup // 等待所有 worker 退出
+	var dirsWg sync.WaitGroup    // 统计“待处理目录”数量（入队 +1，处理完 -1）
+
+	// 启动worker pool
+	for i := 0; i < workers; i++ {
+		workersWg.Add(1)
+		go func() {
+			defer workersWg.Done()
+			for {
+				dir, ok := dirQueue.Pop()
+				if !ok {
+					return
+				}
+				scanner.scanDir(dir, entries, errors, dirQueue, &dirsWg)
+				dirsWg.Done() // 当前目录处理完成
+			}
+		}()
+	}
+
+	// 启动初始目录
+	dirsWg.Add(1)
+	dirQueue.Push(inputpath)
+
+	// 等待所有目录扫描完成后关闭目录队列，让 worker 退出
+	go func() {
+		dirsWg.Wait()
+		dirQueue.Close()
+	}()
+
+	// 等待所有 worker 退出后关闭 entries（通知 tar writer 没有更多条目）
+	workersWg.Wait()
+	close(entries)
+}
+
+// 扫描单个目录：只扫描直接子项，发现的子目录加入队列
+func (scanner *Scanner) scanDir(dirPath string, entries chan string, errors chan error, dirQueue *unboundedDirQueue, dirsWg *sync.WaitGroup) {
+	// 先发送当前目录本身（阻塞发送，确保不丢）
+	entries <- dirPath
+	atomic.AddUint64(&scanner.EntriesEmitted, 1)
+	atomic.AddUint64(&scanner.DirsScanned, 1)
+
+	// 读取目录内容
+	des, err := godirwalk.ReadDirents(dirPath, nil)
+	if err != nil {
+		errors <- err
+		return
+	}
+
+	// 处理目录中的每个条目
+	for _, de := range des {
+		fullPath := filepath.Join(dirPath, de.Name())
+
+		// 发送所有条目（文件和目录）- 阻塞发送，确保不丢
+		entries <- fullPath
+		atomic.AddUint64(&scanner.EntriesEmitted, 1)
+
+		// 如果是目录，加入队列让其他worker处理
+		if de.IsDir() {
+			// 先计数再入队；无界队列不会因为“队列满”丢目录
+			dirsWg.Add(1)
+			if !dirQueue.Push(fullPath) {
+				// 队列已关闭：补偿计数，避免 WaitGroup 永远等不到归零
+				dirsWg.Done()
+			}
+		}
+	}
+}

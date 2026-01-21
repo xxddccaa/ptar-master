@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/karrick/godirwalk"
 )
@@ -76,6 +77,14 @@ type Scanner struct {
 	EntriesEmitted uint64
 }
 
+// GetScanWorkers 返回实际使用的扫描worker数量
+func (scanner *Scanner) GetScanWorkers() int {
+	if scanner.ScanWorkers > 0 {
+		return scanner.ScanWorkers
+	}
+	return 8 // 默认值
+}
+
 func NewScanner() *Scanner {
 	return &Scanner{
 		ScanWorkers: 0, // 0表示使用默认值
@@ -90,6 +99,7 @@ func (scanner *Scanner) ScanStats() (dirs uint64, entries uint64) {
 // 并行扫描实现：使用 worker pool + 目录队列，多个 goroutine 同时扫描不同目录。
 // 重要：绝不丢目录（队列满则阻塞等待），并用 WaitGroup 精确判断扫描完成，避免忙等。
 // 函数会阻塞直到所有目录扫描完成并 entries channel 关闭。
+// 新增：当 entries channel 积压超过阈值时，暂停扫描等待消费，避免浪费资源。
 func (scanner *Scanner) Scan(inputpath string, entries chan string, errors chan error) {
 	// 如果ScanWorkers为0，使用默认值
 	workers := scanner.ScanWorkers
@@ -133,9 +143,14 @@ func (scanner *Scanner) Scan(inputpath string, entries chan string, errors chan 
 }
 
 // 扫描单个目录：只扫描直接子项，发现的子目录加入队列
+// 当 entries channel 积压超过阈值（80000，留20%缓冲）时，暂停发送等待消费
 func (scanner *Scanner) scanDir(dirPath string, entries chan string, errors chan error, dirQueue *unboundedDirQueue, dirsWg *sync.WaitGroup) {
-	// 先发送当前目录本身（阻塞发送，确保不丢）
-	entries <- dirPath
+	const queuePauseThreshold = 80000 // 当队列长度超过此值时暂停扫描
+	const queueResumeThreshold = 60000 // 当队列长度降到此值以下时恢复扫描
+	const pauseCheckInterval = 10 * time.Millisecond // 检查队列长度的间隔
+
+	// 发送当前目录本身（带队列积压控制）
+	scanner.sendEntryWithBackpressure(dirPath, entries, queuePauseThreshold, queueResumeThreshold, pauseCheckInterval)
 	atomic.AddUint64(&scanner.EntriesEmitted, 1)
 	atomic.AddUint64(&scanner.DirsScanned, 1)
 
@@ -150,17 +165,43 @@ func (scanner *Scanner) scanDir(dirPath string, entries chan string, errors chan
 	for _, de := range des {
 		fullPath := filepath.Join(dirPath, de.Name())
 
-		// 发送所有条目（文件和目录）- 阻塞发送，确保不丢
-		entries <- fullPath
+		// 发送所有条目（文件和目录）- 带队列积压控制
+		scanner.sendEntryWithBackpressure(fullPath, entries, queuePauseThreshold, queueResumeThreshold, pauseCheckInterval)
 		atomic.AddUint64(&scanner.EntriesEmitted, 1)
 
 		// 如果是目录，加入队列让其他worker处理
 		if de.IsDir() {
-			// 先计数再入队；无界队列不会因为“队列满”丢目录
+			// 先计数再入队；无界队列不会因为"队列满"丢目录
 			dirsWg.Add(1)
 			if !dirQueue.Push(fullPath) {
 				// 队列已关闭：补偿计数，避免 WaitGroup 永远等不到归零
 				dirsWg.Done()
+			}
+		}
+	}
+}
+
+// sendEntryWithBackpressure 带背压控制的条目发送
+// 当队列积压超过阈值时暂停发送，等待消费
+func (scanner *Scanner) sendEntryWithBackpressure(entryPath string, entries chan string, pauseThreshold, resumeThreshold int, checkInterval time.Duration) {
+	for {
+		// 检查队列长度
+		queueLen := len(entries)
+		if queueLen < pauseThreshold {
+			// 队列未满，直接发送（可能阻塞，但这是正常的背压）
+			entries <- entryPath
+			return
+		}
+		// 队列接近满，等待消费
+		// 使用 ticker 定期检查，避免忙等
+		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			queueLen = len(entries)
+			if queueLen < resumeThreshold {
+				// 队列降到阈值以下，恢复发送
+				entries <- entryPath
+				return
 			}
 		}
 	}

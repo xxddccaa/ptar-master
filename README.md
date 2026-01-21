@@ -85,9 +85,78 @@ done
 - **`--gomaxprocs <N>`**：设置 Go 的并行度上限（等价于 `GOMAXPROCS`）
   - 通常设为**可用 CPU 核心数**（或略小于 cgroup 限制）
 - **`--stats-interval <sec>`**：周期输出 `STATS`（吞吐、累计写入、错误计数、heap 等）
+- **`--max-size <size>`**：单个 tar 文件“目标大小”上限（例如 `20G`/`100M`/`1T`）。达到上限后**下一个条目**会切到新 tar（因此单个 tar 可能略大于设定值，这是为了保证每个 tar 都是可独立解压的完整 tar 流）。
 - **`--pprof <addr>`**：开启 pprof（例如 `:6060`），用于定位瓶颈（CPU/阻塞/锁/内存）
 - **`--index`**：输出 `*.tar.index` 索引文件（用于快速定位条目；是否需要取决于你的下游流程）
 - **`--verbose`**：输出更详细日志（调试时用，线上跑大数据不建议一直开）
+
+## 日志说明（`STATS` / `TAR-FILE`）
+
+你运行时看到的日志主要有两类：
+
+### `STATS ...`
+
+示例（字段顺序与实际输出一致，括号内为单位/口径）：
+
+```
+STATS uptime=42s goroutines=141 threads=128 scanWorkers=8 entries=23/s files=10/s write=5000.00MiB/s totalEntries=8152 totalFiles=396 totalWrite=89.31GiB lstatErr=0 openErr=0 scanDirs=89 scanSpeed=2575/s queuedEntries=1234 channelLen=50000 avgFileSize=2.50MB avgLstat=0.15ms avgOpen=0.20ms avgRead=50.30ms avgWait=0.05ms heap=0.22GiB totalTarFiles=128
+```
+
+- **`uptime`**：程序运行时长
+- **`goroutines`**：当前 Go `goroutine` 数（不是线程数；可粗略看是否有堆积/泄漏）
+- **`threads`**：`--threads` 写入 worker 数
+- **`scanWorkers`**：`--scan-workers` 扫描 worker 数（0 时会用默认值）
+- **`entries`**：写入侧处理的“条目数”速度（条目/秒；目录 + 文件 + 其它 tar 条目）
+- **`files`**：写入侧写入的“普通文件”速度（文件/秒；仅 tar `TypeReg`）
+- **`write`**：写入吞吐（MiB/s；包含 tar header + 文件内容；开压缩时为“压缩后写入”吞吐）
+- **`totalEntries`**：累计处理的条目数
+- **`totalFiles`**：累计写入的普通文件数
+- **`totalWrite`**：累计写入总字节（GiB）
+- **`lstatErr`**：`os.Lstat` 失败计数
+- **`openErr`**：`os.Open` 失败计数
+- **`scanDirs`**：累计扫描过的目录数（扫描侧计数器；每扫描一个目录 +1）
+- **`scanSpeed`**：扫描侧累计条目/秒（从启动到现在的平均扫描速度；用于判断扫描是否瓶颈）
+- **`queuedEntries`**：已扫描但未写入的条目数（在 `entries` channel 队列中等待写入的条目数；`scanEntries - totalEntries`）
+  - **解读**：如果 `queuedEntries` 持续接近 100000（channel 缓冲上限），说明写入侧慢于扫描侧；如果 `queuedEntries` 接近 0，说明写入侧在等扫描侧供给
+- **`channelLen`**：`entries` channel 的当前实际长度（队列积压数；0-100000）
+  - **解读**：与 `queuedEntries` 类似，但这是实时快照；如果持续接近 100000，说明写入侧处理不过来
+- **`avgFileSize`**：平均文件大小（MB；`totalWrite / totalFiles`）
+  - **解读**：帮助判断是大量小文件还是少量大文件；小文件多时，`lstat/open` 耗时占比更高
+- **`avgLstat`**：平均 `lstat` 耗时（毫秒）
+  - **解读**：如果很高（>1ms），说明文件系统元数据访问慢（可能是网络 FS/分布式 FS 瓶颈）
+- **`avgOpen`**：平均 `open` 耗时（毫秒）
+  - **解读**：如果很高，说明文件打开慢（可能是文件系统/网络延迟）
+- **`avgRead`**：平均文件读取耗时（毫秒；包含 `io.CopyBuffer` 的完整读取时间）
+  - **解读**：如果很高但文件不大，可能是 IO 带宽不足或文件系统慢
+- **`avgWait`**：平均从 `entries` channel 等待条目的耗时（毫秒）
+  - **解读**：如果很高，说明写入线程经常在等扫描侧供给；如果接近 0，说明扫描侧供给充足
+- **`heap`**：当前 Go heap 使用量（GiB）
+- **`totalTarFiles`**：累计创建的 tar 文件数量（`--max-size` 模式下尤其有用）
+
+> 如何解读你贴的那段日志：`write` 很高但 `entries/files` 很低，通常意味着正在写大文件/少量大文件；`entries/files` 高则更像是大量小文件持续流入。
+
+### `[TAR-FILE] ...`
+
+- **`[TAR-FILE] Created new tar file: ... (file #xxxxx)`**：创建了一个新的 tar 分卷文件（`--max-size` 模式下会频繁出现）
+- **`[TAR-FILE] Closed tar file: ... (size=..., duration=..., file #xxxxx)`**：该分卷写入完成并关闭（size 为最终大小，可能略大于 `--max-size`）
+
+### `[THREAD-x] Completed ...`
+
+- 表示某个写入 worker 退出时的汇总（处理文件数/写入字节/耗时）。
+
+## “队列限制 100000/1024” 是什么？
+
+代码里有两个关键的 channel 缓冲区大小（你可能记成 10000，但当前代码是 100000）：
+
+- **`entries` channel 缓冲 = 100000**：扫描侧把“条目路径”（目录 + 文件）推到这里，写入侧从这里消费并写入 tar。  
+  - **意义**：把“扫描”和“写入”解耦，允许扫描先跑一段把路径攒起来，减少两边互相等的概率；在大量小文件/深目录时更稳。  
+  - **代价**：峰值会多占一些内存（主要是 100000 个路径字符串在队列里时的内存）。  
+  - **现象**：如果写入侧慢，`entries` 会堆积；如果扫描侧慢，写入线程会等 `entries` 供给。
+
+- **`errors` channel 缓冲 = 1024**：各处错误通过这个 channel 汇报并打印。  
+  - **意义**：避免短时间内大量错误时生产者被阻塞（但真实出错一般也会直接中断/影响流程）。
+
+另外，扫描器内部还有一个 **无界目录队列**（`unboundedDirQueue`），它是为了避免“有界队列满了导致扫描 worker 全部阻塞、没人继续消费”的死锁风险；它不是 100000 这种固定上限，而是按需增长（但会有内部收缩逻辑）。
 
 ## 性能调优建议（不改代码只调参数）
 
@@ -98,9 +167,46 @@ done
   - 先把 `--compression none` 用起来（如果你目标是速度）
   - 再调 `--scan-workers`（小文件/深目录一般更敏感）
   - 最后才考虑调 `--threads`
-- **遇到“CPU0 满，其它核很低”一般正常**
+- **遇到"CPU0 满，其它核很低"一般正常**
   - Go 运行时/聚合写入/内核 IO 等会造成看起来像单核更忙
   - 是否需要调整以吞吐为准：看 `STATS write/files/entries` 是否上升
+
+## 使用日志排查写入变慢问题
+
+新增的性能指标可以帮助你快速定位瓶颈：
+
+### 1. 判断是扫描瓶颈还是写入瓶颈
+- **`queuedEntries` 接近 0 且 `avgWait` 很高** → 写入线程在等扫描侧，**扫描是瓶颈**
+  - 解决：增加 `--scan-workers` 或检查文件系统元数据性能
+- **`queuedEntries` 接近 100000 或 `channelLen` 很高** → 扫描侧快但写入侧慢，**写入是瓶颈**
+  - 解决：检查 `avgLstat/avgOpen/avgRead` 是否异常高
+
+### 2. 判断文件系统性能问题
+- **`avgLstat > 1ms`** → 元数据访问慢（常见于网络 FS/分布式 FS）
+  - 解决：检查元数据服务器负载、网络延迟；考虑降低 `--scan-workers` 减少并发压力
+- **`avgOpen > 5ms`** → 文件打开慢
+  - 解决：检查文件系统性能、网络延迟（如果是网络 FS）
+- **`avgRead` 很高但文件不大** → IO 带宽不足或文件系统慢
+  - 解决：检查存储 IOPS/带宽、网络带宽（如果是网络 FS）
+
+### 3. 判断文件大小分布
+- **`avgFileSize < 1MB` 且 `files/s` 很高** → 大量小文件，瓶颈通常在元数据操作（`lstat/open`）
+- **`avgFileSize > 10MB` 且 `files/s` 很低** → 少量大文件，瓶颈通常在 `read` 操作
+
+### 4. 综合判断示例
+```
+# 场景1：扫描瓶颈
+scanSpeed=400/s, queuedEntries=0, avgWait=10ms, channelLen=0
+→ 扫描侧慢，写入线程在等
+
+# 场景2：元数据瓶颈（JuiceFS/网络FS常见）
+avgLstat=5ms, avgOpen=8ms, scanSpeed=500/s, queuedEntries=50000
+→ 元数据操作慢，导致整体变慢
+
+# 场景3：IO瓶颈
+avgRead=200ms, avgFileSize=50MB, write=100MiB/s
+→ 文件读取慢，可能是存储带宽不足
+```
 
 ## pprof 怎么用（定位到底卡在哪）
 
@@ -170,11 +276,14 @@ gnutar  10hr20m
 ## 实用指令
 
 ```
-./ptar -c \
-  -f /mnt/jfs5/stage1_tar/stage1 \
-  --threads 128 \
-  --scan-workers 8 \
+cp -f /mnt/s3fs/ptar-master/ptar /mnt/jfs6/
+chmod 777 /mnt/jfs6/ptar
+/mnt/jfs6/ptar -c \
+  -f /mnt/jfs5/haolong_data_tar/data \
+  --threads 64 \
+  --scan-workers 256 \
   --gomaxprocs 72 \
   --compression none \
-  /mnt/jfs5/stage1
+  --max-size 20G \
+  /mnt/jfs5/haolong_data
 ```

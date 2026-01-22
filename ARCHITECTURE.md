@@ -261,6 +261,53 @@ func (m *tarFileManager) createNewFile() (*threadTarFile, error)
 /path/to/file2.txt	file too large: 60GB, exceeds threshold 50GB
 ```
 
+### 完整文件恢复流程
+
+**场景**：第一次打包时，部分文件因超时被补 0 填充（不完整），如何恢复所有完整文件？
+
+**解决方案**：使用"先解压主 tar + 再解压 miss.tar 覆盖"的两步恢复流程
+
+**步骤**：
+
+1. **第一次打包**（可能产生不完整文件）：
+   ```bash
+   ./ptar -c -f output --threads 16 /input/dir
+   # 生成：output.00000.tar, output.00001.tar, ...
+   # 如果有些文件超时，会生成：output_miss.txt
+   ```
+
+2. **使用 miss 模式重试打包失败的文件**：
+   ```bash
+   ./ptar -c -f output --miss-file output_miss.txt --compression none
+   # 生成：output_miss.tar（包含所有失败文件的完整版本）
+   ```
+
+3. **解压恢复**（两步覆盖）：
+   ```bash
+   # 第一步：解压主 tar 文件（包含大部分完整文件 + 一些不完整文件）
+   mkdir -p restore
+   cd restore
+   for f in ../output.*.tar; do
+     tar -xf "$f"
+   done
+   
+   # 第二步：解压 miss.tar 并覆盖（用完整文件替换不完整文件）
+   tar -xf ../output_miss.tar --overwrite
+   # 或者使用：tar -xf ../output_miss.tar --overwrite-dir
+   ```
+
+**原理**：
+- 第一次打包的 tar 文件包含：
+  - ✅ 大部分文件（完整）
+  - ❌ 部分超时文件（不完整，末尾补 0）
+- miss.tar 只包含失败的文件（这次是完整的）
+- 先解压主 tar 得到目录结构，再解压 miss.tar 覆盖，就能得到所有完整文件
+
+**注意事项**：
+- 确保使用 `--overwrite` 选项，否则 tar 可能跳过已存在的文件
+- 或者先删除不完整文件再解压 miss.tar
+- 建议在解压前检查 `output_miss.txt` 确认有哪些文件需要覆盖
+
 ## 关键设计决策
 
 ### 1. 为什么使用无界目录队列？
@@ -324,8 +371,14 @@ func (arch *Archive) copyWithTimeout(w io.Writer, r io.ReadCloser,
 
 **关键点**：
 - 超时后关闭文件，让阻塞的 read 退出
-- 补 0 填充，保证 tar 流结构合法
-- 记录失败文件到 miss.txt，后续可重试
+- **补 0 填充剩余字节**：这是为了保证 tar 流结构合法，避免 `archive/tar: missed writing N bytes` 的 panic
+- **重要**：补 0 填充后的文件是**不完整的**，解压出来不能用（文件末尾是 0 字节填充）
+- 该文件会被记录到 `miss.txt`，后续需要使用 `--miss-file` 模式重试打包才能得到完整文件
+
+**设计权衡**：
+- 为什么不能直接跳过文件？因为 tar header 已经写入，如果文件内容不完整，会导致 tar 流结构不合法，程序会 panic
+- 为什么选择补 0 而不是回滚？回滚需要维护复杂的状态，且可能影响其他已写入的文件
+- 因此采用"补 0 保证结构合法 + miss.txt 记录 + 后续重试"的策略，既保证程序稳定运行，又提供了容错机制
 
 ## 性能优化要点
 

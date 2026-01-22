@@ -65,6 +65,7 @@ make
 
 ### 2) 解包（恢复目录）
 
+**基本解包**（如果所有文件都打包成功）：
 ```bash
 mkdir -p /path/to/restore
 cd /path/to/restore
@@ -72,6 +73,24 @@ for f in /path/to/output/archive_prefix.*.tar; do
   tar -xf "$f"
 done
 ```
+
+**完整恢复**（如果有文件失败，需要两步覆盖）：
+```bash
+mkdir -p /path/to/restore
+cd /path/to/restore
+
+# 第一步：解压主 tar 文件（包含大部分完整文件 + 一些不完整文件）
+for f in /path/to/output/archive_prefix.*.tar; do
+  tar -xf "$f"
+done
+
+# 第二步：如果有 miss.tar，解压并覆盖不完整文件
+if [ -f /path/to/output/archive_prefix_miss.tar ]; then
+  tar -xf /path/to/output/archive_prefix_miss.tar --overwrite
+fi
+```
+
+> **说明**：第一次打包时，如果某些文件因读取超时被补 0 填充，这些文件是不完整的。需要先用 miss 模式重试打包生成 `{prefix}_miss.tar`，然后先解压主 tar，再解压 miss.tar 覆盖，才能得到所有完整文件。
 
 ### 3) 重试打包失败的文件（miss 模式）
 
@@ -84,7 +103,7 @@ done
   --compression none
 ```
 
-这会生成单个 tar 文件：`archive_prefix_miss.tar`，包含所有失败的文件。
+这会生成单个 tar 文件：`archive_prefix_miss.tar`，包含所有失败的文件（这次是完整的）。
 
 ## 常用参数说明（结合你实际跑大数据时最常用的）
 

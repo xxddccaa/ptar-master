@@ -3,6 +3,7 @@ package ptar
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
@@ -24,6 +25,16 @@ import (
 	"time"
 )
 
+// 仅在检测到“明显卡住”时打印线程当前正在处理的文件，避免逐文件刷屏
+const (
+	stuckMinQueuedEntries = 1
+	stuckMaxReportThreads = 5
+	// 满足“files/s 很低且队列有积压”时认为卡住（为了适配大文件场景，用 files/s 而不是 entries/s）
+	stuckFilesPerSecThreshold = 0.0
+	// 线程处理同一个文件超过该时间，stats 卡住时就会被打印出来
+	stuckMinFileElapsed = 30 * time.Second
+)
+
 // tarFileManager 管理共享的文件编号分配（无锁设计，每个线程独立写入）
 type tarFileManager struct {
 	outputPath    string
@@ -33,6 +44,7 @@ type tarFileManager struct {
 	indexEnabled  bool
 	maxSize       int64 // 0表示不限制
 	fileCounter   int64 // 全局文件计数器（使用atomic，无锁）
+	isMissMode    bool  // 是否是 miss 模式（单文件输出，不使用编号）
 }
 
 // threadTarFile 表示线程的当前tar文件（每个线程独立，无锁写入）
@@ -51,7 +63,7 @@ type threadTarFile struct {
 	mgr           *tarFileManager // 指向管理器，用于获取新文件编号
 }
 
-func newTarFileManager(outputPath, compression string, maxSize int64, fileMaker func(string) (io.WriteCloser, error), indexer func() *index.Index, indexEnabled bool) *tarFileManager {
+func newTarFileManager(outputPath, compression string, maxSize int64, fileMaker func(string) (io.WriteCloser, error), indexer func() *index.Index, indexEnabled bool, isMissMode bool) *tarFileManager {
 	return &tarFileManager{
 		outputPath:   outputPath,
 		compression:  compression,
@@ -60,6 +72,7 @@ func newTarFileManager(outputPath, compression string, maxSize int64, fileMaker 
 		indexEnabled: indexEnabled,
 		maxSize:      maxSize,
 		fileCounter:  0,
+		isMissMode:   isMissMode,
 	}
 }
 
@@ -71,8 +84,15 @@ func (m *tarFileManager) allocateFileNumber() int64 {
 // createNewFile 为线程创建新的tar文件（线程独立调用，无锁）
 func (m *tarFileManager) createNewFile() (*threadTarFile, error) {
 	fileNum := m.allocateFileNumber()
-	// 文件编号从 0 开始，但输出时固定 5 位补零：0->00000, 1->00001
-	filename := fmt.Sprintf("%s.%05d.tar%s", m.outputPath, fileNum, m.compression)
+	var filename string
+	if m.isMissMode {
+		// miss 模式：单文件输出，不使用编号
+		// 注意：miss 模式应该只使用单线程，所以 fileNum 应该始终为 0
+		filename = fmt.Sprintf("%s.tar%s", m.outputPath, m.compression)
+	} else {
+		// 文件编号从 0 开始，但输出时固定 5 位补零：0->00000, 1->00001
+		filename = fmt.Sprintf("%s.%05d.tar%s", m.outputPath, fileNum, m.compression)
+	}
 
 	f, err := m.fileMaker(filename)
 	if err != nil {
@@ -205,6 +225,90 @@ type Archive struct {
 	stats         *archiveStats
 	tarFileMgr    *tarFileManager // 共享的tar文件管理器
 	useSharedPool bool            // 是否使用共享文件池（当TarMaxSize > 0时）
+	missFile      io.WriteCloser  // 用于记录跳过的文件
+	missFileMutex sync.Mutex       // 保护 missFile 写入的互斥锁
+	isMissMode    bool            // 是否是 miss 模式（单文件输出）
+
+	// 每个写入线程的“当前正在处理的文件状态”，用于卡住时定位（不刷屏）
+	threadStates []atomic.Value // 存 *threadFileState 或 nil
+	
+	// 用于确保 entries channel 只关闭一次
+	entriesCloseOnce sync.Once
+	
+	// 用于通知 statsReporter 退出
+	statsDone chan struct{}
+	
+	// 用于通知监控 goroutine 退出
+	monitorDone chan struct{}
+}
+
+type threadFileState struct {
+	Path      string
+	SizeBytes int64
+	StartUnix int64 // time.Now().UnixNano()
+}
+
+func (arch *Archive) setThreadState(threadnum int, path string, sizeBytes int64) {
+	if threadnum < 0 || threadnum >= len(arch.threadStates) {
+		return
+	}
+	arch.threadStates[threadnum].Store(&threadFileState{
+		Path:      path,
+		SizeBytes: sizeBytes,
+		StartUnix: time.Now().UnixNano(),
+	})
+}
+
+func (arch *Archive) clearThreadState(threadnum int) {
+	if threadnum < 0 || threadnum >= len(arch.threadStates) {
+		return
+	}
+	arch.threadStates[threadnum].Store((*threadFileState)(nil))
+}
+
+// padToTarSize 在“已写tar header但文件内容未写满”的情况下，用 0 填充剩余字节，
+// 以保证 tar 流结构合法，避免 archive/tar: missed writing N bytes 的 panic。
+func (arch *Archive) padToTarSize(w io.Writer, remaining int64) {
+	if remaining <= 0 {
+		return
+	}
+	zero := make([]byte, 32*1024)
+	for remaining > 0 {
+		n := int64(len(zero))
+		if remaining < n {
+			n = remaining
+		}
+		_, _ = w.Write(zero[:n])
+		remaining -= n
+	}
+}
+
+type copyResult struct {
+	n   int64
+	err error
+}
+
+// copyWithTimeout：只允许 copy goroutine 写入 tar.Writer；超时则通过 Close 触发 copy 退出，
+// 等 copy 退出后再由调用方（同一个 goroutine）决定是否补 0，避免并发写 tar.Writer 导致内部状态损坏。
+func (arch *Archive) copyWithTimeout(w io.Writer, r io.ReadCloser, buf []byte, timeout time.Duration) (n int64, timedOut bool, err error) {
+	done := make(chan copyResult, 1)
+	go func() {
+		cn, ce := io.CopyBuffer(w, r, buf)
+		done <- copyResult{n: cn, err: ce}
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case res := <-done:
+		return res.n, false, res.err
+	case <-timer.C:
+		// 尝试关闭文件让阻塞 read 退出（JuiceFS/网络FS场景通常能打断）
+		_ = r.Close()
+		res := <-done
+		return res.n, true, res.err
+	}
 }
 
 type archiveStats struct {
@@ -225,6 +329,9 @@ type archiveStats struct {
 	readCount      uint64 // read 调用次数（文件读取次数）
 	waitTimeNs     uint64 // 从 channel 等待条目的累计耗时（纳秒）
 	waitCount      uint64 // 等待次数
+
+	// 卡住报告节流（纳秒时间戳）
+	lastStuckReportNs int64
 }
 
 func NewArchive(inputpath string, outputpath string, tarthreads int, compression string, index bool) *Archive {
@@ -241,6 +348,11 @@ func NewArchive(inputpath string, outputpath string, tarthreads int, compression
 	return arch
 }
 
+// SetMissMode 设置 miss 模式
+func (arch *Archive) SetMissMode(isMissMode bool) {
+	arch.isMissMode = isMissMode
+}
+
 func (arch *Archive) Begin() {
 	arch.globalwg = new(sync.WaitGroup)
 	arch.scanwg = new(sync.WaitGroup)
@@ -250,15 +362,42 @@ func (arch *Archive) Begin() {
 	arch.errors = make(chan error, 1024)
 	arch.stats = &archiveStats{start: time.Now()}
 
+	// 初始化线程状态数组（用于卡住时定位当前文件）
+	arch.threadStates = make([]atomic.Value, arch.TarThreads)
+	for i := 0; i < arch.TarThreads; i++ {
+		arch.threadStates[i].Store((*threadFileState)(nil))
+	}
+
+	// 初始化 miss.txt 文件（用于记录跳过的文件）
+	// miss 模式下不需要创建此文件，因为 miss 模式不会跳过任何文件
+	if !arch.isMissMode {
+		missFilePath := arch.OutputPath + "_miss.txt"
+		missFile, err := arch.FileMaker(missFilePath)
+		if err != nil {
+			fmt.Printf("[WARN] Failed to create miss file %s: %v\n", missFilePath, err)
+			// 不中断程序，只是无法记录跳过的文件
+			arch.missFile = nil
+		} else {
+			arch.missFile = missFile
+			fmt.Printf("[INIT] Miss file created: %s\n", missFilePath)
+		}
+	} else {
+		arch.missFile = nil
+	}
+
 	if arch.Scanner == nil {
 		return
 	}
 
-	// 如果设置了TarMaxSize，使用共享文件池模式
-	arch.useSharedPool = arch.TarMaxSize > 0
+	// 如果设置了TarMaxSize 或者是 miss 模式，使用共享文件池模式
+	arch.useSharedPool = arch.TarMaxSize > 0 || arch.isMissMode
 	if arch.useSharedPool {
-		arch.tarFileMgr = newTarFileManager(arch.OutputPath, arch.Compression, arch.TarMaxSize, arch.FileMaker, arch.Indexer, arch.Index)
-		fmt.Printf("[INIT] Using shared tar file pool with max-size=%d bytes (%.2fGiB)\n", arch.TarMaxSize, float64(arch.TarMaxSize)/(1024*1024*1024))
+		arch.tarFileMgr = newTarFileManager(arch.OutputPath, arch.Compression, arch.TarMaxSize, arch.FileMaker, arch.Indexer, arch.Index, arch.isMissMode)
+		if arch.isMissMode {
+			fmt.Printf("[INIT] Using miss mode: single tar file output (%s.tar%s)\n", arch.OutputPath, arch.Compression)
+		} else {
+			fmt.Printf("[INIT] Using shared tar file pool with max-size=%d bytes (%.2fGiB)\n", arch.TarMaxSize, float64(arch.TarMaxSize)/(1024*1024*1024))
+		}
 	} else {
 		fmt.Printf("[INIT] Using per-thread tar files (threads=%d)\n", arch.TarThreads)
 	}
@@ -272,6 +411,7 @@ func (arch *Archive) Begin() {
 
 	// Optional: periodic stats
 	if arch.StatsEverySeconds > 0 {
+		arch.statsDone = make(chan struct{})
 		arch.globalwg.Add(1)
 		go arch.statsReporter(time.Duration(arch.StatsEverySeconds) * time.Second)
 	}
@@ -296,11 +436,91 @@ func (arch *Archive) Begin() {
 	}
 	// go channelcounter(wg, "files", entries)
 	arch.scanwg.Wait()
+	
+	// 扫描完成后，启动一个监控 goroutine 来检查是否所有条目都已处理完成
+	// 如果 queuedEntries=0 且 channelLen=0，说明所有条目都已处理，可以关闭 channel
+	arch.monitorDone = make(chan struct{})
+	arch.globalwg.Add(1)
+	go func() {
+		defer arch.globalwg.Done()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		
+		// 立即检查一次，不等待第一个 tick
+		checkAndClose := func() bool {
+			// 检查队列状态
+			channelLen := len(arch.entries)
+			entries := atomic.LoadUint64(&arch.stats.entriesRead)
+			
+			// 计算 queuedEntries
+			var queuedEntries int64 = 0
+			type scanStats interface{ ScanStats() (dirs uint64, entries uint64) }
+			if ss, ok := arch.Scanner.(scanStats); ok {
+				_, scanEntries := ss.ScanStats()
+				if scanEntries >= entries {
+					queuedEntries = int64(scanEntries - entries)
+				}
+			}
+			
+			// 如果队列为空且所有条目都已处理，尝试关闭 channel
+			if queuedEntries == 0 && channelLen == 0 {
+				// 使用 sync.Once 确保只关闭一次
+				arch.entriesCloseOnce.Do(func() {
+					// 再等待一小段时间确保所有条目都已从 channel 中取出
+					time.Sleep(500 * time.Millisecond)
+					// 再次检查，确保真的为空
+					if len(arch.entries) == 0 {
+						// 使用 recover 来安全地关闭 channel（如果已经被关闭，会 panic）
+						defer func() {
+							if r := recover(); r != nil {
+								// channel 已经被关闭，这是正常的
+							}
+						}()
+						close(arch.entries)
+					}
+				})
+				return true // 表示应该退出
+			}
+			return false
+		}
+		
+		// 立即检查一次
+		if checkAndClose() {
+			return
+		}
+		
+		// 然后定期检查
+		for {
+			select {
+			case <-arch.monitorDone:
+				// 收到退出信号，退出
+				return
+			case <-ticker.C:
+				if checkAndClose() {
+					return
+				}
+			}
+		}
+	}()
+	
 	// arch.globalwg.Done()
 	arch.partitionswg.Wait()
 
+	// 通知监控 goroutine 和 statsReporter 退出
+	if arch.monitorDone != nil {
+		close(arch.monitorDone)
+	}
+	if arch.statsDone != nil {
+		close(arch.statsDone)
+	}
+
 	close(arch.errors)
 	arch.globalwg.Wait()
+
+	// 关闭 miss.txt 文件
+	if arch.missFile != nil {
+		arch.missFile.Close()
+	}
 
 	// 注意：在共享池模式下，每个线程会自己关闭文件，这里不需要额外操作
 }
@@ -313,7 +533,14 @@ func (arch *Archive) statsReporter(every time.Duration) {
 	var lastEntries, lastFiles, lastBytes uint64
 	var m runtime.MemStats
 
-	for range ticker.C {
+	for {
+		select {
+		case <-arch.statsDone:
+			// 收到退出信号，退出
+			return
+		case <-ticker.C:
+			// 继续执行统计逻辑
+		}
 		entries := atomic.LoadUint64(&arch.stats.entriesRead)
 		files := atomic.LoadUint64(&arch.stats.filesReg)
 		bytes := atomic.LoadUint64(&arch.stats.bytesWritten)
@@ -412,6 +639,68 @@ func (arch *Archive) statsReporter(every time.Duration) {
 			float64(m.HeapAlloc)/(1024*1024*1024),
 			currentTarInfo,
 		)
+
+		// 仅当“明显卡住”时输出当前正在处理的文件（避免刷屏）
+		if queuedEntries >= stuckMinQueuedEntries && dFiles <= stuckFilesPerSecThreshold {
+			nowNs := time.Now().UnixNano()
+			last := atomic.LoadInt64(&arch.stats.lastStuckReportNs)
+			// 至少间隔一个 stats 周期再报（避免每秒狂刷）
+			if last == 0 || time.Duration(nowNs-last) >= every {
+				atomic.StoreInt64(&arch.stats.lastStuckReportNs, nowNs)
+
+				type item struct {
+					thread int
+					path   string
+					size   int64
+					elapsed time.Duration
+				}
+				items := make([]item, 0, arch.TarThreads)
+				for t := 0; t < len(arch.threadStates); t++ {
+					v := arch.threadStates[t].Load()
+					if v == nil {
+						continue
+					}
+					st, ok := v.(*threadFileState)
+					if !ok || st == nil || st.Path == "" || st.StartUnix == 0 {
+						continue
+					}
+					elapsed := time.Duration(nowNs - st.StartUnix)
+					if elapsed < stuckMinFileElapsed {
+						continue
+					}
+					items = append(items, item{
+						thread:  t,
+						path:    st.Path,
+						size:    st.SizeBytes,
+						elapsed: elapsed,
+					})
+				}
+				// 按 elapsed 降序
+				for i := 0; i < len(items); i++ {
+					for j := i + 1; j < len(items); j++ {
+						if items[j].elapsed > items[i].elapsed {
+							items[i], items[j] = items[j], items[i]
+						}
+					}
+				}
+				if len(items) > 0 {
+					n := stuckMaxReportThreads
+					if len(items) < n {
+						n = len(items)
+					}
+					fmt.Printf("[STUCK] files/s=%.0f queuedEntries=%d, slow threads (top %d):\n", dFiles, queuedEntries, n)
+					for k := 0; k < n; k++ {
+						it := items[k]
+						fmt.Printf("[STUCK] thread=%d elapsed=%s size=%.2fGiB path=%s\n",
+							it.thread,
+							it.elapsed.Truncate(time.Second),
+							float64(it.size)/(1024*1024*1024),
+							it.path,
+						)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -512,7 +801,7 @@ func (arch *Archive) tarChannelShared(threadnum int, copyBuf []byte, filesProces
 		}
 
 		// 处理文件条目（无锁，因为每个线程有自己的tar writer）
-		arch.processEntryShared(i, currentFile, copyBuf, filesProcessed, bytesProcessed)
+		arch.processEntryShared(threadnum, i, currentFile, copyBuf, filesProcessed, bytesProcessed)
 	}
 
 	// 关闭当前文件
@@ -522,7 +811,7 @@ func (arch *Archive) tarChannelShared(threadnum int, copyBuf []byte, filesProces
 }
 
 // processEntryShared 在共享模式下处理单个条目（无锁，每个线程独立写入）
-func (arch *Archive) processEntryShared(entryPath string, ttf *threadTarFile, copyBuf []byte, filesProcessed *uint64, bytesProcessed *uint64) {
+func (arch *Archive) processEntryShared(threadnum int, entryPath string, ttf *threadTarFile, copyBuf []byte, filesProcessed *uint64, bytesProcessed *uint64) {
 	atomic.AddUint64(&arch.stats.entriesRead, 1)
 	if arch.Verbose {
 		fmt.Printf("%s\n", entryPath)
@@ -538,6 +827,25 @@ func (arch *Archive) processEntryShared(entryPath string, ttf *threadTarFile, co
 		atomic.AddUint64(&arch.stats.lstatErr, 1)
 		arch.errors <- serr
 		panic(serr)
+	}
+
+	// 检测超大文件（远超过 max-size，比如超过 50G 或 100G）
+	// 如果设置了 max-size，且文件大小超过 max-size 的 2.5 倍，直接跳过
+	// miss 模式下不跳过任何文件，这是最后一次兜底打包
+	if !arch.isMissMode && arch.TarMaxSize > 0 && s.Mode().IsRegular() {
+		fileSize := s.Size()
+		// 如果文件大小超过 max-size 的 2.5 倍，或者超过 50G（取较大值），直接跳过
+		skipThreshold := arch.TarMaxSize * 5 / 2 // 2.5倍
+		if skipThreshold < 50*1024*1024*1024 {
+			skipThreshold = 50 * 1024 * 1024 * 1024 // 至少50G
+		}
+		if fileSize > skipThreshold {
+			reason := fmt.Sprintf("file too large: %d bytes (%.2fGiB), exceeds threshold %.2fGiB", 
+				fileSize, float64(fileSize)/(1024*1024*1024), float64(skipThreshold)/(1024*1024*1024))
+			fmt.Printf("[WARN] Skipping oversized file: %s (%s)\n", entryPath, reason)
+			arch.recordMissedFile(entryPath, reason)
+			return // 跳过该文件
+		}
 	}
 
 	var ientry index.IndexItem
@@ -571,6 +879,11 @@ func (arch *Archive) processEntryShared(entryPath string, ttf *threadTarFile, co
 	if hdr.Typeflag == tar.TypeReg {
 		atomic.AddUint64(&arch.stats.filesReg, 1)
 		*filesProcessed++
+
+		fileSize := s.Size()
+		arch.setThreadState(threadnum, entryPath, fileSize)
+		defer arch.clearThreadState(threadnum)
+		
 		var hash hashWriter
 		if arch.Index && ttf.index != nil {
 			hash = sha1.New()
@@ -591,11 +904,70 @@ func (arch *Archive) processEntryShared(entryPath string, ttf *threadTarFile, co
 		before := ttf.writeCounter.Pos()
 		// 记录 read 耗时
 		readStart := time.Now()
-		if arch.Index && ttf.index != nil {
-			_, _ = io.CopyBuffer(io.MultiWriter(ttf.tarWriter, hash), sf, copyBuf)
+		
+		var n int64
+		var copyErr error
+		
+		// miss 模式下不使用超时限制，这是最后一次兜底打包
+		if arch.isMissMode {
+			// miss 模式：无超时限制，直接读取
+			var w io.Writer = ttf.tarWriter
+			if arch.Index && ttf.index != nil {
+				w = io.MultiWriter(ttf.tarWriter, hash)
+			}
+			
+			// 创建带进度跟踪的 Reader
+			pr := &progressReader{
+				r:         sf,
+				filePath:  entryPath,
+				fileSize:  fileSize,
+				startTime: readStart,
+			}
+			
+			n, copyErr = io.CopyBuffer(w, pr, copyBuf)
 		} else {
-			_, _ = io.CopyBuffer(ttf.tarWriter, sf, copyBuf)
+			// 普通模式：使用超时限制
+			// 对于大文件（>100MB），如果读取超过 60 秒，跳过该文件
+			readTimeout := 30 * time.Second
+			if fileSize > 100*1024*1024 {
+				readTimeout = 60 * time.Second // 大文件给更长时间
+			}
+			
+			// 使用带超时的 context 控制读取
+			readCtx, readCancel := context.WithTimeout(context.Background(), readTimeout)
+			defer readCancel()
+
+			// 用安全的 copyWithTimeout：超时通过 Close 触发 copy 退出，避免并发写 tar.Writer
+			var w io.Writer = ttf.tarWriter
+			if arch.Index && ttf.index != nil {
+				w = io.MultiWriter(ttf.tarWriter, hash)
+			}
+			// 这里以 readTimeout 为准（readCtx 只用于触发超时语义）
+			_ = readCtx
+			var timedOut bool
+			n, timedOut, copyErr = arch.copyWithTimeout(w, sf, copyBuf, readTimeout)
+			if timedOut {
+				// copy 已退出，安全补 0
+				readDuration := time.Since(readStart)
+				remaining := fileSize - n
+				if remaining < 0 {
+					remaining = 0
+				}
+				if remaining > 0 {
+					arch.padToTarSize(ttf.tarWriter, remaining)
+				}
+				reason := fmt.Sprintf("read timeout: elapsed=%v, timeout=%v, padded=%d bytes", readDuration, readTimeout, remaining)
+				fmt.Printf("[WARN] Read timeout, skipping file: %s (size=%d, %s)\n", entryPath, fileSize, reason)
+				arch.recordMissedFile(entryPath, reason)
+				return
+			}
 		}
+
+		if copyErr != nil {
+			arch.errors <- fmt.Errorf("read error for %s: %v", entryPath, copyErr)
+			panic(copyErr)
+		}
+		
 		readDuration := time.Since(readStart)
 		atomic.AddUint64(&arch.stats.readTimeNs, uint64(readDuration.Nanoseconds()))
 		atomic.AddUint64(&arch.stats.readCount, 1)
@@ -700,6 +1072,26 @@ func (arch *Archive) tarChannelPerThread(threadnum int, copyBuf []byte, filesPro
 			panic(serr)
 		}
 
+		// 检测超大文件（远超过 max-size，比如超过 50G 或 100G）
+		// 如果设置了 max-size，且文件大小超过 max-size 的 2.5 倍，直接跳过
+		// miss 模式下不跳过任何文件，这是最后一次兜底打包
+		if !arch.isMissMode && arch.TarMaxSize > 0 && s.Mode().IsRegular() {
+			fileSize := s.Size()
+			// 如果文件大小超过 max-size 的 2.5 倍，或者超过 50G（取较大值），直接跳过
+			skipThreshold := arch.TarMaxSize * 5 / 2 // 2.5倍
+			if skipThreshold < 50*1024*1024*1024 {
+				skipThreshold = 50 * 1024 * 1024 * 1024 // 至少50G
+			}
+			if fileSize > skipThreshold {
+				reason := fmt.Sprintf("file too large: %d bytes (%.2fGiB), exceeds threshold %.2fGiB", 
+					fileSize, float64(fileSize)/(1024*1024*1024), float64(skipThreshold)/(1024*1024*1024))
+				fmt.Printf("[WARN] Skipping oversized file: %s (%s)\n", i, reason)
+				arch.recordMissedFile(i, reason)
+				arch.clearThreadState(threadnum)
+				continue // 跳过该文件
+			}
+		}
+
 		var ientry index.IndexItem
 		if arch.Index {
 			ientry = index.IndexItem{Name: i}
@@ -730,6 +1122,9 @@ func (arch *Archive) tarChannelPerThread(threadnum int, copyBuf []byte, filesPro
 		if hdr.Typeflag == tar.TypeReg {
 			atomic.AddUint64(&arch.stats.filesReg, 1)
 			*filesProcessed++
+			fileSize := s.Size()
+			arch.setThreadState(threadnum, i, fileSize)
+
 			var hash hashWriter
 			if arch.Index {
 				hash = sha1.New()
@@ -748,11 +1143,68 @@ func (arch *Archive) tarChannelPerThread(threadnum int, copyBuf []byte, filesPro
 			before := cw.Pos()
 			// 记录 read 耗时
 			readStart := time.Now()
-			if arch.Index {
-				_, _ = io.CopyBuffer(io.MultiWriter(tw, hash), sf, copyBuf)
+			
+			var n int64
+			var copyErr error
+			
+			// miss 模式下不使用超时限制，这是最后一次兜底打包
+			if arch.isMissMode {
+				// miss 模式：无超时限制，直接读取
+				var w io.Writer = tw
+				if arch.Index {
+					w = io.MultiWriter(tw, hash)
+				}
+				
+				// 创建带进度跟踪的 Reader
+				pr := &progressReader{
+					r:         sf,
+					filePath:  i,
+					fileSize:  fileSize,
+					startTime: readStart,
+				}
+				
+				n, copyErr = io.CopyBuffer(w, pr, copyBuf)
 			} else {
-				_, _ = io.CopyBuffer(tw, sf, copyBuf)
+				// 普通模式：使用超时限制
+				readTimeout := 30 * time.Second
+				if fileSize > 100*1024*1024 {
+					readTimeout = 60 * time.Second
+				}
+				
+				readCtx, readCancel := context.WithTimeout(context.Background(), readTimeout)
+				defer readCancel()
+
+				// 安全的 copyWithTimeout（避免并发写 tar.Writer）
+				var w io.Writer = tw
+				if arch.Index {
+					w = io.MultiWriter(tw, hash)
+				}
+				_ = readCtx
+				var timedOut bool
+				n, timedOut, copyErr = arch.copyWithTimeout(w, sf, copyBuf, readTimeout)
+				if timedOut {
+					// copy 已退出，安全补 0
+					readDuration := time.Since(readStart)
+					remaining := fileSize - n
+					if remaining < 0 {
+						remaining = 0
+					}
+					if remaining > 0 {
+						arch.padToTarSize(tw, remaining)
+					}
+					reason := fmt.Sprintf("read timeout: elapsed=%v, timeout=%v, padded=%d bytes", readDuration, readTimeout, remaining)
+					fmt.Printf("[WARN] Read timeout, skipping file: %s (size=%d, %s)\n", i, fileSize, reason)
+					arch.recordMissedFile(i, reason)
+					arch.clearThreadState(threadnum)
+					continue
+				}
 			}
+
+			if copyErr != nil {
+				arch.errors <- fmt.Errorf("read error for %s: %v", i, copyErr)
+				panic(copyErr)
+			}
+			
 			readDuration := time.Since(readStart)
 			atomic.AddUint64(&arch.stats.readTimeNs, uint64(readDuration.Nanoseconds()))
 			atomic.AddUint64(&arch.stats.readCount, 1)
@@ -766,6 +1218,7 @@ func (arch *Archive) tarChannelPerThread(threadnum int, copyBuf []byte, filesPro
 			if closeerr != nil {
 				panic(closeerr)
 			}
+			arch.clearThreadState(threadnum)
 			if arch.Index {
 				ientry.Hash = hex.EncodeToString(hash.Sum(nil))
 			}
@@ -786,6 +1239,46 @@ func (arch *Archive) tarChannelPerThread(threadnum int, copyBuf []byte, filesPro
 type hashWriter interface {
 	io.Writer
 	Sum([]byte) []byte
+}
+
+// progressReader 包装 io.Reader，用于在 miss 模式下跟踪读取进度
+type progressReader struct {
+	r         io.Reader
+	filePath  string
+	fileSize  int64
+	startTime time.Time
+	readBytes int64
+	mu        sync.Mutex
+	lastReport time.Time
+}
+
+func (pr *progressReader) Read(p []byte) (n int, err error) {
+	n, err = pr.r.Read(p)
+	pr.mu.Lock()
+	pr.readBytes += int64(n)
+	now := time.Now()
+	// 每 10 秒输出一次进度
+	if now.Sub(pr.lastReport) >= 10*time.Second || pr.lastReport.IsZero() {
+		elapsed := now.Sub(pr.startTime)
+		progressPercent := float64(0)
+		if pr.fileSize > 0 {
+			progressPercent = float64(pr.readBytes) / float64(pr.fileSize) * 100
+		}
+		speed := float64(0)
+		if elapsed.Seconds() > 0 {
+			speed = float64(pr.readBytes) / elapsed.Seconds() / (1024 * 1024) // MiB/s
+		}
+		fmt.Printf("[MISS-PROGRESS] Processing: %s (size=%.2fGiB, elapsed=%s, read=%.2fGiB, progress=%.1f%%, speed=%.2fMiB/s)\n",
+			pr.filePath,
+			float64(pr.fileSize)/(1024*1024*1024),
+			elapsed.Truncate(time.Second),
+			float64(pr.readBytes)/(1024*1024*1024),
+			progressPercent,
+			speed)
+		pr.lastReport = now
+	}
+	pr.mu.Unlock()
+	return n, err
 }
 
 // createMinimalTarHeader 创建简化的 tar header，只保留必要信息
@@ -824,4 +1317,16 @@ func (arch *Archive) createMinimalTarHeader(fi os.FileInfo, name string, linknam
 	}
 
 	return hdr
+}
+
+// recordMissedFile 线程安全地记录跳过的文件到 miss.txt
+func (arch *Archive) recordMissedFile(filePath string, reason string) {
+	if arch.missFile == nil {
+		return
+	}
+	arch.missFileMutex.Lock()
+	defer arch.missFileMutex.Unlock()
+	// 格式：文件路径\t原因\n
+	line := fmt.Sprintf("%s\t%s\n", filePath, reason)
+	arch.missFile.Write([]byte(line))
 }

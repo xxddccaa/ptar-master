@@ -33,6 +33,7 @@ type rootConfig struct {
 	StatsEvery  int
 	PprofAddr   string
 	MaxSize     string // 每个tar文件的最大大小，如 "20G"
+	MissFile    string // miss.txt 文件路径，用于重试打包超时的文件
 }
 
 func RegularFileCreate(filename string) (io.WriteCloser, error) {
@@ -118,7 +119,8 @@ func main() {
 	app.Flag("file", "(File) Prefix to use for output files. Ex: output => output.tar.gz").Required().Short('f').StringVar(&config.Prefix)
 	app.Flag("index", "Enable Index output").BoolVar(&config.Index)
 	app.Flag("max-size", "Maximum size per tar file (e.g., 20G, 100M). When exceeded, switches to new tar file. 0=unlimited (default: one tar per thread)").StringVar(&config.MaxSize)
-	app.Arg("input", "Input Path(s)").Required().StringVar(&config.Input)
+	app.Flag("miss-file", "Path to miss.txt file containing failed file paths. When specified, only files listed in this file will be packed into {prefix}_miss.tar").StringVar(&config.MissFile)
+	app.Arg("input", "Input Path(s)").StringVar(&config.Input)
 	app.Version(version)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
@@ -149,6 +151,9 @@ func main() {
 		debug.SetGCPercent(config.GOGCPercent)
 	}
 
+	// 检查是否是 miss 模式
+	isMissMode := config.MissFile != ""
+
 	// Parse max-size if provided
 	var maxSizeBytes int64 = 0
 	if config.MaxSize != "" && config.MaxSize != "0" {
@@ -157,6 +162,37 @@ func main() {
 		if err != nil {
 			log.Fatalf("Invalid max-size format: %v (examples: 20G, 100M, 1T)", err)
 		}
+	}
+	
+	// miss 模式下，强制单文件模式和单线程
+	if isMissMode {
+		maxSizeBytes = 0 // 0 表示不限制大小，但我们会通过其他方式确保单文件
+		config.Threads = 1 // miss 模式只使用单线程，确保只创建一个文件
+	}
+
+	// 如果指定了 miss-file，使用 MissFileScanner；否则使用普通 Scanner
+	var sc ptar.Scanner
+	if isMissMode {
+		// miss 模式：从文件读取路径列表
+		sc = scanner.NewMissFileScanner(config.MissFile)
+		// miss 模式下，输出文件名改为 {prefix}_miss.tar
+		config.Prefix = config.Prefix + "_miss"
+		// miss 模式下，Input 可以为空（实际上不使用）
+		if config.Input == "" {
+			config.Input = "." // 占位符，实际不使用
+		}
+		// miss 模式下，禁用 max-size（生成单个 tar 文件）
+		if config.MaxSize == "" {
+			config.MaxSize = "0" // 0 表示不限制，但我们会强制单文件模式
+		}
+	} else {
+		// 普通模式：扫描目录
+		if config.Input == "" {
+			log.Fatalf("Input path is required when not using --miss-file")
+		}
+		normalScanner := scanner.NewScanner()
+		normalScanner.ScanWorkers = config.ScanWorkers
+		sc = normalScanner
 	}
 
 	// NewArchive(inputpath string, outputpath string, tarthreads int, compression string, index bool) (*Archive)
@@ -169,8 +205,7 @@ func main() {
 	}
 	arch.PprofAddr = config.PprofAddr
 	arch.TarMaxSize = maxSizeBytes
-	sc := scanner.NewScanner()
-	sc.ScanWorkers = config.ScanWorkers
+	arch.SetMissMode(isMissMode)
 	arch.Scanner = sc
 	arch.Indexer = index.NewIndex
 	arch.FileMaker = RegularFileCreate

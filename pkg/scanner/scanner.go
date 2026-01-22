@@ -1,7 +1,10 @@
 package scanner
 
 import (
+	"bufio"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -200,6 +203,99 @@ func (scanner *Scanner) sendEntryWithBackpressure(entryPath string, entries chan
 			queueLen = len(entries)
 			if queueLen < resumeThreshold {
 				// 队列降到阈值以下，恢复发送
+				entries <- entryPath
+				return
+			}
+		}
+	}
+}
+
+// MissFileScanner 从 miss.txt 文件读取路径列表的 Scanner
+type MissFileScanner struct {
+	MissFilePath string
+	EntriesEmitted uint64
+}
+
+// NewMissFileScanner 创建新的 MissFileScanner
+func NewMissFileScanner(missFilePath string) *MissFileScanner {
+	return &MissFileScanner{
+		MissFilePath: missFilePath,
+	}
+}
+
+// GetScanWorkers 返回扫描worker数量（miss模式不需要worker）
+func (scanner *MissFileScanner) GetScanWorkers() int {
+	return 1
+}
+
+// ScanStats 返回统计信息
+func (scanner *MissFileScanner) ScanStats() (dirs uint64, entries uint64) {
+	return 0, atomic.LoadUint64(&scanner.EntriesEmitted)
+}
+
+// Scan 从 miss.txt 文件读取路径并发送到 entries channel
+// 文件格式：每行是 "文件路径\t原因" 或 "文件路径 原因"（制表符或空格分隔）
+func (mfs *MissFileScanner) Scan(inputpath string, entries chan string, errors chan error) {
+	file, err := os.Open(mfs.MissFilePath)
+	if err != nil {
+		errors <- err
+		close(entries)
+		return
+	}
+	defer file.Close()
+
+	const queuePauseThreshold = 80000
+	const queueResumeThreshold = 60000
+	const pauseCheckInterval = 10 * time.Millisecond
+
+	fileScanner := bufio.NewScanner(file)
+	for fileScanner.Scan() {
+		line := strings.TrimSpace(fileScanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// 解析文件路径（第一列，可能是制表符或空格分隔）
+		var filePath string
+		if idx := strings.Index(line, "\t"); idx >= 0 {
+			filePath = strings.TrimSpace(line[:idx])
+		} else if idx := strings.Index(line, "  "); idx >= 0 {
+			// 多个空格分隔
+			filePath = strings.TrimSpace(line[:idx])
+		} else {
+			// 没有分隔符，整行就是路径
+			filePath = line
+		}
+
+		if filePath == "" {
+			continue
+		}
+
+		// 发送路径（带背压控制）
+		mfs.sendEntryWithBackpressure(filePath, entries, queuePauseThreshold, queueResumeThreshold, pauseCheckInterval)
+		atomic.AddUint64(&mfs.EntriesEmitted, 1)
+	}
+
+	if err := fileScanner.Err(); err != nil {
+		errors <- err
+	}
+
+	close(entries)
+}
+
+// sendEntryWithBackpressure 带背压控制的条目发送（与 Scanner 相同）
+func (mfs *MissFileScanner) sendEntryWithBackpressure(entryPath string, entries chan string, pauseThreshold, resumeThreshold int, checkInterval time.Duration) {
+	for {
+		queueLen := len(entries)
+		if queueLen < pauseThreshold {
+			entries <- entryPath
+			return
+		}
+		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			queueLen = len(entries)
+			if queueLen < resumeThreshold {
 				entries <- entryPath
 				return
 			}

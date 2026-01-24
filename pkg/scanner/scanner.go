@@ -103,7 +103,7 @@ func (scanner *Scanner) ScanStats() (dirs uint64, entries uint64) {
 // 重要：绝不丢目录（队列满则阻塞等待），并用 WaitGroup 精确判断扫描完成，避免忙等。
 // 函数会阻塞直到所有目录扫描完成并 entries channel 关闭。
 // 新增：当 entries channel 积压超过阈值时，暂停扫描等待消费，避免浪费资源。
-func (scanner *Scanner) Scan(inputpath string, entries chan string, errors chan error) {
+func (scanner *Scanner) Scan(inputpaths []string, entries chan string, errors chan error) {
 	// 如果ScanWorkers为0，使用默认值
 	workers := scanner.ScanWorkers
 	if workers <= 0 {
@@ -130,9 +130,11 @@ func (scanner *Scanner) Scan(inputpath string, entries chan string, errors chan 
 		}()
 	}
 
-	// 启动初始目录
-	dirsWg.Add(1)
-	dirQueue.Push(inputpath)
+	// 启动初始目录（支持多个输入路径）
+	for _, inputpath := range inputpaths {
+		dirsWg.Add(1)
+		dirQueue.Push(inputpath)
+	}
 
 	// 等待所有目录扫描完成后关闭目录队列，让 worker 退出
 	go func() {
@@ -235,7 +237,8 @@ func (scanner *MissFileScanner) ScanStats() (dirs uint64, entries uint64) {
 
 // Scan 从 miss.txt 文件读取路径并发送到 entries channel
 // 文件格式：每行是 "文件路径\t原因" 或 "文件路径 原因"（制表符或空格分隔）
-func (mfs *MissFileScanner) Scan(inputpath string, entries chan string, errors chan error) {
+// 注意：miss 模式下，inputpaths 参数会被忽略，因为路径从 miss.txt 文件读取
+func (mfs *MissFileScanner) Scan(inputpaths []string, entries chan string, errors chan error) {
 	file, err := os.Open(mfs.MissFilePath)
 	if err != nil {
 		errors <- err

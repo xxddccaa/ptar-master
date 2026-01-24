@@ -325,13 +325,13 @@ dd if=/dev/zero of=10G bs=1M count=10240 status=progress
 cp -f /mnt/s3fs/ptar-master/ptar /mnt/jfs6/
 chmod 777 /mnt/jfs6/ptar
 /mnt/jfs6/ptar -c \
-  -f /mnt/jfs5/llamafactory_train_data_style_tar/data \
+  -f /mnt/jfs5/llamafactory_train_data_style_processed_tar/data \
   --threads 64 \
   --scan-workers 256 \
   --gomaxprocs 72 \
   --compression none \
   --max-size 20G \
-  /mnt/jfs5/llamafactory_train_data_style
+  /mnt/jfs5/llamafactory_train_data_style_processed
 ```
 
 ### 重试打包失败的文件

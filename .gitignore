@@ -12,6 +12,5 @@ medium_output/
 *.tar
 
 # built binary (local artifact)
-/ptar
 
 rlaunch.sh

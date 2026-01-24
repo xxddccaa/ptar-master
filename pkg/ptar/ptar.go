@@ -193,7 +193,7 @@ type Indexer interface {
 }
 
 type Scanner interface {
-	Scan(string, chan string, chan error)
+	Scan([]string, chan string, chan error)
 }
 
 /*
@@ -204,7 +204,7 @@ type Partition struct {
 */
 
 type Archive struct {
-	InputPath    string
+	InputPaths   []string // 支持多个输入路径
 	OutputPath   string
 	TarThreads   int
 	TarMaxSize   int64 // 改为int64以支持大文件大小
@@ -334,9 +334,9 @@ type archiveStats struct {
 	lastStuckReportNs int64
 }
 
-func NewArchive(inputpath string, outputpath string, tarthreads int, compression string, index bool) *Archive {
+func NewArchive(inputpaths []string, outputpath string, tarthreads int, compression string, index bool) *Archive {
 	arch := &Archive{
-		InputPath:   inputpath,
+		InputPaths:   inputpaths,
 		OutputPath:  outputpath,
 		TarThreads:  tarthreads,
 		Compression: compression,
@@ -416,10 +416,11 @@ func (arch *Archive) Begin() {
 		go arch.statsReporter(time.Duration(arch.StatsEverySeconds) * time.Second)
 	}
 
+	// 启动扫描器（支持多个输入路径，它们会被并行扫描）
 	arch.globalwg.Add(1)
 	arch.scanwg.Add(1)
 	go func() {
-		arch.Scanner.Scan(arch.InputPath, arch.entries, arch.errors)
+		arch.Scanner.Scan(arch.InputPaths, arch.entries, arch.errors)
 		arch.scanwg.Done()
 		arch.globalwg.Done()
 	}()

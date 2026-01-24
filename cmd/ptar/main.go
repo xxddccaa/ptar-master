@@ -21,7 +21,7 @@ import (
 type rootConfig struct {
 	Compression string
 	Prefix      string
-	Input       string
+	Inputs      []string // 支持多个输入路径
 	Debug       bool
 	Index       bool
 	Threads     int
@@ -120,7 +120,7 @@ func main() {
 	app.Flag("index", "Enable Index output").BoolVar(&config.Index)
 	app.Flag("max-size", "Maximum size per tar file (e.g., 20G, 100M). When exceeded, switches to new tar file. 0=unlimited (default: one tar per thread)").StringVar(&config.MaxSize)
 	app.Flag("miss-file", "Path to miss.txt file containing failed file paths. When specified, only files listed in this file will be packed into {prefix}_miss.tar").StringVar(&config.MissFile)
-	app.Arg("input", "Input Path(s)").StringVar(&config.Input)
+	app.Arg("input", "Input Path(s)").StringsVar(&config.Inputs)
 	app.Version(version)
 	kingpin.MustParse(app.Parse(os.Args[1:]))
 
@@ -138,7 +138,7 @@ func main() {
 		log.Println("  Scan Workers: ", config.ScanWorkers)
 		log.Println("  Compression: ", config.Compression)
 		log.Println("  Prefix: ", config.Prefix)
-		log.Println("  Input: ", config.Input)
+		log.Println("  Inputs: ", config.Inputs)
 		log.Println("  Debug: ", config.Debug)
 		log.Println("  Indexes: ", config.Index)
 	}
@@ -177,9 +177,9 @@ func main() {
 		sc = scanner.NewMissFileScanner(config.MissFile)
 		// miss 模式下，输出文件名改为 {prefix}_miss.tar
 		config.Prefix = config.Prefix + "_miss"
-		// miss 模式下，Input 可以为空（实际上不使用）
-		if config.Input == "" {
-			config.Input = "." // 占位符，实际不使用
+		// miss 模式下，Inputs 可以为空（实际上不使用）
+		if len(config.Inputs) == 0 {
+			config.Inputs = []string{"."} // 占位符，实际不使用
 		}
 		// miss 模式下，禁用 max-size（生成单个 tar 文件）
 		if config.MaxSize == "" {
@@ -187,16 +187,27 @@ func main() {
 		}
 	} else {
 		// 普通模式：扫描目录
-		if config.Input == "" {
-			log.Fatalf("Input path is required when not using --miss-file")
+		if len(config.Inputs) == 0 {
+			log.Fatalf("At least one input path is required when not using --miss-file")
+		}
+		// 处理相对路径：如果输入路径是相对路径，基于当前工作目录解析
+		cwd, err := os.Getwd()
+		if err != nil {
+			log.Fatalf("Failed to get current working directory: %v", err)
+		}
+		for i, input := range config.Inputs {
+			if !filepath.IsAbs(input) {
+				// 相对路径：基于当前工作目录解析
+				config.Inputs[i] = filepath.Join(cwd, input)
+			}
 		}
 		normalScanner := scanner.NewScanner()
 		normalScanner.ScanWorkers = config.ScanWorkers
 		sc = normalScanner
 	}
 
-	// NewArchive(inputpath string, outputpath string, tarthreads int, compression string, index bool) (*Archive)
-	arch := ptar.NewArchive(config.Input, config.Prefix, config.Threads, config.Compression, config.Index)
+	// NewArchive 现在接受多个输入路径
+	arch := ptar.NewArchive(config.Inputs, config.Prefix, config.Threads, config.Compression, config.Index)
 	arch.Verbose = config.Verbose
 	arch.StatsEverySeconds = config.StatsEvery
 	if arch.StatsEverySeconds == 0 {
